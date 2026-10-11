@@ -1,20 +1,33 @@
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import soundfile as sf
+import torch
 from dotenv import load_dotenv
 from huggingface_hub import snapshot_download
+from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+from transformers.audio_utils import load_audio
 
 load_dotenv()
-MODEL_ID = "bodhan-ai/indic-transcribe-core"
+DIAR_MODEL_ID = "nvidia/Nemotron-3-Diarization"
+ASR_MODEL_ID = "bodhan-ai/indic-transcribe-core"
 SHORT_CLIP_SECONDS = 40
 OUT_DIR = Path(__file__).resolve().parent / "out"
 
 
-def load_model():
+def load_models():
+    print(f"Loading {DIAR_MODEL_ID}", file=sys.stderr)
+    processor = AutoProcessor.from_pretrained(DIAR_MODEL_ID)
+    diar_model = AutoModelForAudioFrameClassification.from_pretrained(DIAR_MODEL_ID)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    diar_model = diar_model.to(device)
+    diar_model.eval()
+    print(f"device={device}", file=sys.stderr)
+
     try:
-        resolved = Path(snapshot_download(MODEL_ID))
+        resolved = Path(snapshot_download(ASR_MODEL_ID))
     except Exception as exc:
         raise SystemExit(f"Error loading model: {exc}") from exc
 
@@ -22,25 +35,40 @@ def load_model():
     from indic_transcribe import IndicTranscribe
     from long_form import transcribe_long
 
-    print(f"Loading {MODEL_ID}", file=sys.stderr)
-    return IndicTranscribe.from_pretrained(str(resolved)), transcribe_long
+    print(f"Loading {ASR_MODEL_ID}", file=sys.stderr)
+    asr = IndicTranscribe.from_pretrained(str(resolved))
+    return processor, diar_model, asr, transcribe_long
 
 
-def transcribe_file(asr, transcribe_long, path: Path) -> None:
-    info = sf.info(str(path))
-    if info.frames / info.samplerate <= SHORT_CLIP_SECONDS:
-        text, lid = asr.transcribe(str(path), return_lid=True)
-        print(f"[{path.name}] lang={lid.get('lang', 'unknown')}", file=sys.stderr)
+def diarize(processor, model, path: Path) -> list[dict]:
+    sampling_rate = processor.feature_extractor.sampling_rate
+    audio = load_audio(str(path), sampling_rate=sampling_rate)
+    inputs = processor(audio, sampling_rate=sampling_rate).to(
+        model.device, dtype=model.dtype
+    )
+    with torch.inference_mode():
+        logits = model(**inputs).logits
+    return processor.extract_speaker_dict(logits, inputs.attention_mask)[0]
+
+
+def transcribe_span(
+    asr, transcribe_long, source: Path, start: float, end: float, lang, clip: Path
+) -> str:
+    info = sf.info(str(source))
+    start_frame = max(0, int(start * info.samplerate))
+    end_frame = min(info.frames, int(end * info.samplerate))
+    if end_frame <= start_frame:
+        return ""
+
+    audio, sample_rate = sf.read(
+        str(source), start=start_frame, stop=end_frame, always_2d=True
+    )
+    sf.write(clip, audio.mean(axis=1), sample_rate)
+    if (end_frame - start_frame) / sample_rate <= SHORT_CLIP_SECONDS:
+        text = asr(str(clip), lang=lang) if lang else asr(str(clip))
     else:
-        text = transcribe_long(asr, str(path))
-        ranked = asr.identify(str(path))
-        detected = ranked[0][0] if ranked else "unknown"
-        print(f"[{path.name}] lang={detected}", file=sys.stderr)
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    destination = OUT_DIR / f"{path.stem}.txt"
-    destination.write_text(text.strip() + "\n", encoding="utf-8")
-    print(destination, file=sys.stderr)
+        text = transcribe_long(asr, str(clip), lang=lang)
+    return str(text).strip()
 
 
 def main() -> None:
@@ -50,8 +78,38 @@ def main() -> None:
     if not audio.is_file():
         raise SystemExit(f"Audio file not found: {audio}")
 
-    asr, transcribe_long = load_model()
-    transcribe_file(asr, transcribe_long, audio)
+    processor, diar_model, asr, transcribe_long = load_models()
+    segments = diarize(processor, diar_model, audio)
+    print(segments, file=sys.stderr)
+    del processor, diar_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    ranked = asr.identify(str(audio))
+    lang = ranked[0][0] if ranked else None
+    print(f"[{audio.name}] lang={lang or 'unknown'}", file=sys.stderr)
+
+    lines = []
+    with tempfile.TemporaryDirectory() as tmp:
+        clip = Path(tmp) / "clip.wav"
+        for segment in segments:
+            text = transcribe_span(
+                asr,
+                transcribe_long,
+                audio,
+                segment["Start"],
+                segment["End"],
+                lang,
+                clip,
+            )
+            speaker = f"speaker_{segment['Speaker']}"
+            lines.append(
+                f"{speaker} [{segment['Start']:.2f}-{segment['End']:.2f}] {text}"
+            )
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    destination = OUT_DIR / f"{audio.stem}.txt"
+    destination.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    print(destination, file=sys.stderr)
 
 
 if __name__ == "__main__":
